@@ -66,14 +66,16 @@ info "Cargando ConfigMap idle-manager-script..."
 PROJECTS_FILE="$SCRIPT_DIR/projects.txt"
 SCRIPT_FILE="$ROOT_DIR/oc-idle-manager.sh"
 
-[[ -f "$SCRIPT_FILE" ]]   || die "No se encontro: $SCRIPT_FILE"
-[[ -f "$PROJECTS_FILE" ]] || die "No se encontro: $PROJECTS_FILE"
+#[[ -f "$SCRIPT_FILE" ]]   || die "No se encontro: $SCRIPT_FILE"
+#[[ -f "$PROJECTS_FILE" ]] || die "No se encontro: $PROJECTS_FILE"
+#
+#oc create configmap idle-manager-script \
+#    --from-file=oc-idle-manager.sh="$SCRIPT_FILE" \
+#    --from-file=projects.txt="$PROJECTS_FILE" \
+#    -n idle-ops \
+#    --dry-run=client -o yaml | oc apply -f -
 
-oc create configmap idle-manager-script \
-    --from-file=oc-idle-manager.sh="$SCRIPT_FILE" \
-    --from-file=projects.txt="$PROJECTS_FILE" \
-    -n idle-ops \
-    --dry-run=client -o yaml | oc apply -f -
+oc apply -f configmap.yaml
 
 ok "ConfigMap idle-manager-script actualizado."
 
