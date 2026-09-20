@@ -15,9 +15,10 @@ Solución para gestionar automáticamente el estado idle/activo de servicios en 
 7. [Aplicaciones demo](#7-aplicaciones-demo)
 8. [Instalación paso a paso](#8-instalación-paso-a-paso)
 9. [Operaciones](#9-operaciones)
-10. [Monitoreo y logs](#10-monitoreo-y-logs)
-11. [Consideraciones para producción](#11-consideraciones-para-producción)
-12. [Troubleshooting](#12-troubleshooting)
+10. [Procedimiento de rollback](#10-procedimiento-de-rollback)
+11. [Monitoreo y logs](#11-monitoreo-y-logs)
+12. [Consideraciones para producción](#12-consideraciones-para-producción)
+13. [Troubleshooting](#13-troubleshooting)
 
 ---
 
@@ -65,7 +66,11 @@ Job ad-hoc (o CronJob con acción rollback)
 │
 ├── idle-ops/                       # Infraestructura del proyecto idle-ops
 │   ├── setup.yaml                  # Todos los recursos OCP (Namespace, SA, RBAC, PVC, CronJob)
+│   ├── configmap.yaml              # ConfigMap con el script y projects.txt (alternativa a install.sh)
 │   ├── rbac-per-namespace.yaml     # Alternativa least-privilege (RoleBinding por proyecto)
+│   ├── rollback-job.yaml           # Template de Job para ejecutar rollbacks manuales
+│   ├── debug-pvc.yaml              # Pod temporal para leer el contenido del PVC
+│   ├── debug-job.yaml              # Job de diagnóstico con bash -x
 │   ├── projects.txt                # Lista de proyectos a gestionar
 │   └── install.sh                  # Script de instalación idempotente
 │
@@ -551,38 +556,7 @@ oc create job idle-single-$(date +%s) -n idle-ops \
 
 ### Ejecutar rollback
 
-#### Rollback al último snapshot (todos los proyectos)
-
-```bash
-# Crear un Job desde el CronJob y modificar la acción
-oc create job rollback-$(date +%s) \
-    --from=cronjob/idle-manager \
-    -n idle-ops
-
-# Editar los args del Job:
-# args: ["rollback", "-f", "/scripts/projects.txt"]
-```
-
-#### Rollback de un proyecto específico
-
-```bash
-# Listar snapshots disponibles para el proyecto
-oc exec -n idle-ops \
-    $(oc get pods -n idle-ops -l app.kubernetes.io/name=idle-manager \
-      --field-selector=status.phase=Running -o name | head -1) \
-    -- ls /data/states/ | grep python-demo
-
-# Rollback al último snapshot
-oc create job rollback-python-$(date +%s) -n idle-ops \
-    --image=quay.io/openshift/origin-cli:4.18 \
-    -- /bin/bash /scripts/oc-idle-manager.sh rollback -p python-demo
-
-# Rollback a un snapshot específico
-oc create job rollback-python-$(date +%s) -n idle-ops \
-    --image=quay.io/openshift/origin-cli:4.18 \
-    -- /bin/bash /scripts/oc-idle-manager.sh rollback \
-         -p python-demo --state-id 20250101_200000
-```
+Ver el [Procedimiento de rollback](#10-procedimiento-de-rollback) para la guía paso a paso completa.
 
 ### Actualizar la lista de proyectos
 
@@ -614,7 +588,137 @@ oc patch cronjob idle-manager -n idle-ops \
 
 ---
 
-## 10. Monitoreo y logs
+## 10. Procedimiento de rollback
+
+El rollback restaura los workloads de uno o más proyectos a la cantidad de réplicas que tenían justo antes del último `idle`. El script lee el snapshot de estado guardado en el PVC y ejecuta `oc scale` por cada recurso registrado.
+
+> **Prerequisito:** debe existir al menos un snapshot en el PVC para cada proyecto a restaurar. Los snapshots se crean automáticamente al inicio de cada ejecución de `idle`. Sin snapshot no hay rollback posible.
+
+### Paso 1 — Verificar snapshots disponibles
+
+Antes de iniciar un rollback, confirmar qué snapshots existen en el PVC:
+
+```bash
+oc apply -f debug-pvc.yaml
+oc logs pod/pvc-check -n idle-ops -f
+oc delete pod/pvc-check -n idle-ops
+```
+
+La sección `=== /data/states ===` muestra los archivos disponibles:
+
+```
+python-demo_20260920_200021.state
+node-demo_20260920_200021.state
+java-demo_20260920_200021.state
+```
+
+El formato del nombre es `<proyecto>_<YYYYMMDD_HHMMSS>.state`. El timestamp identifica el momento en que se ejecutó el idle.
+
+### Paso 2 — Editar rollback-job.yaml
+
+El archivo `idle-ops/rollback-job.yaml` es el template para ejecutar rollbacks. Editar los `args` según el caso:
+
+#### Caso A — Rollback de todos los proyectos (último snapshot de cada uno)
+
+```yaml
+args:
+  - "rollback"
+  - "-f"
+  - "/scripts/projects.txt"
+```
+
+#### Caso B — Rollback de un proyecto específico
+
+```yaml
+args:
+  - "rollback"
+  - "-p"
+  - "python-demo"
+```
+
+#### Caso C — Rollback de varios proyectos específicos
+
+```yaml
+args:
+  - "rollback"
+  - "-P"
+  - "python-demo,node-demo"
+```
+
+#### Caso D — Rollback a un snapshot específico (no el más reciente)
+
+```yaml
+args:
+  - "rollback"
+  - "-p"
+  - "python-demo"
+  - "--state-id"
+  - "20260920_200021"
+```
+
+El `--state-id` es el timestamp del archivo `.state` visto en el Paso 1.
+
+#### Caso E — Dry-run (verificar sin aplicar cambios)
+
+Agregar `--dry-run` a cualquiera de los casos anteriores:
+
+```yaml
+args:
+  - "rollback"
+  - "-f"
+  - "/scripts/projects.txt"
+  - "--dry-run"
+```
+
+### Paso 3 — Ejecutar el rollback
+
+```bash
+oc apply -f rollback-job.yaml
+```
+
+### Paso 4 — Seguir los logs en tiempo real
+
+```bash
+oc logs job/idle-rollback -n idle-ops -f
+```
+
+Salida esperada:
+
+```
+[2026-09-20 20:15:03] [===  ] --- oc-idle-manager start ---
+[2026-09-20 20:15:03] [INFO ] Action:    rollback
+[2026-09-20 20:15:03] [INFO ] Projects:  python-demo node-demo java-demo
+[2026-09-20 20:15:04] [===  ] --- Rolling back project: python-demo ---
+[2026-09-20 20:15:04] [INFO ] [python-demo] Using state snapshot: /data/states/python-demo_20260920_200021.state
+[2026-09-20 20:15:04] [INFO ] [python-demo] Scaling deployment/python-app to 2 replica(s)
+[2026-09-20 20:15:05] [OK   ] [python-demo] deployment/python-app scaled to 2
+[2026-09-20 20:15:05] [OK   ] [python-demo] Rollback completed successfully
+...
+[2026-09-20 20:15:08] [===  ] --- Summary ---
+[2026-09-20 20:15:08] [INFO ] Total projects processed: 3
+[2026-09-20 20:15:08] [OK   ] Succeeded: 3
+```
+
+### Paso 5 — Verificar que los pods levantaron
+
+```bash
+oc get pods -n python-demo
+oc get pods -n node-demo
+oc get pods -n java-demo
+```
+
+### Paso 6 — Limpiar el Job
+
+```bash
+oc delete job/idle-rollback -n idle-ops
+```
+
+> **Nota:** si se necesita ejecutar otro rollback, eliminar el Job primero. `rollback-job.yaml` siempre crea un Job con el mismo nombre `idle-rollback`. Alternativamente, editar `metadata.name` con un nombre único por ejecución.
+
+---
+
+## 11. Monitoreo y logs
+
 
 ### Ver logs de la última ejecución
 
@@ -666,7 +770,7 @@ Configurar alertas en el stack de monitoreo del cluster para:
 
 ---
 
-## 11. Consideraciones para producción
+## 12. Consideraciones para producción
 
 ### RBAC
 
@@ -715,7 +819,7 @@ Configurar alertas en el stack de monitoreo del cluster para:
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 ### El CronJob no se ejecuta
 

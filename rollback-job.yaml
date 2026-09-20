@@ -1,0 +1,105 @@
+# =============================================================================
+# idle-ops/rollback-job.yaml
+# Job ad-hoc para ejecutar un rollback manual.
+#
+# Uso:
+#   1. Editar los args de este archivo según el caso de uso (ver opciones abajo)
+#   2. oc apply -f rollback-job.yaml
+#   3. oc logs job/idle-rollback -n idle-ops -f
+#   4. oc delete job/idle-rollback -n idle-ops   (limpiar cuando termine)
+#
+# OPCIONES DE ARGS:
+#
+#   Rollback de todos los proyectos en projects.txt (ultimo snapshot de cada uno):
+#     args: ["rollback", "-f", "/scripts/projects.txt"]
+#
+#   Rollback de un proyecto específico (ultimo snapshot):
+#     args: ["rollback", "-p", "python-demo"]
+#
+#   Rollback de varios proyectos específicos (ultimo snapshot):
+#     args: ["rollback", "-P", "python-demo,node-demo"]
+#
+#   Rollback de un proyecto a un snapshot específico:
+#     args: ["rollback", "-p", "python-demo", "--state-id", "20260920_200021"]
+#
+#   Dry-run (ver qué haría sin aplicar cambios):
+#     args: ["rollback", "-f", "/scripts/projects.txt", "--dry-run"]
+#
+# PREREQUISITO:
+#   Debe existir al menos un snapshot en el PVC para cada proyecto a restaurar.
+#   Los snapshots se crean automáticamente antes de cada operación idle.
+#   Ver snapshots disponibles con: oc apply -f debug-pvc.yaml
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: idle-rollback
+  namespace: idle-ops
+  labels:
+    app.kubernetes.io/name: idle-manager
+    app.kubernetes.io/component: rollback
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: idle-manager
+        app.kubernetes.io/component: rollback
+    spec:
+      serviceAccountName: idle-manager
+      restartPolicy: Never
+
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000710000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: idle-manager
+          image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+          imagePullPolicy: IfNotPresent
+
+          command: ["/bin/bash", "/scripts/oc-idle-manager.sh"]
+
+          # --- Editar los args según el caso de uso (ver comentarios arriba) ---
+          args:
+            - "rollback"
+            - "-f"
+            - "/scripts/projects.txt"
+
+          env:
+            - name: OC_IDLE_STATE_DIR
+              value: /data/states
+            - name: OC_IDLE_LOG_DIR
+              value: /data/logs
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: data
+              mountPath: /data
+
+      volumes:
+        - name: scripts
+          configMap:
+            name: idle-manager-script
+            defaultMode: 0555
+        - name: data
+          persistentVolumeClaim:
+            claimName: idle-manager-data
