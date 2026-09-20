@@ -1,0 +1,209 @@
+# =============================================================================
+# demo-apps/node-demo.yaml
+# Proyecto: node-demo | 3 pods | Node.js 20 con modulo http nativo
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Namespace
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: node-demo
+  labels:
+    app.kubernetes.io/managed-by: demo-apps
+    idle-ops/managed: "true"
+
+---
+# -----------------------------------------------------------------------------
+# 2. Codigo de la aplicacion
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-app-code
+  namespace: node-demo
+  labels:
+    app: node-app
+data:
+  server.js: |
+    'use strict';
+    /**
+     * Demo HTTP server — sin dependencias externas.
+     * Usa unicamente el modulo 'http' de Node.js stdlib.
+     */
+    const http = require('http');
+    const os   = require('os');
+
+    const PORT    = parseInt(process.env.PORT || '3000', 10);
+    const VERSION = '1.0.0';
+
+    const server = http.createServer((req, res) => {
+      const payload = {
+        app:      'node-demo',
+        version:  VERSION,
+        language: `Node.js ${process.version}`,
+        message:  'Hola desde Node.js!',
+        hostname: os.hostname(),
+        path:     req.url,
+        method:   req.method,
+      };
+
+      const body = JSON.stringify(payload, null, 2);
+      res.writeHead(200, {
+        'Content-Type':   'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body),
+      });
+      res.end(body);
+
+      console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - 200`);
+    });
+
+    server.on('error', (err) => {
+      console.error('Server error:', err);
+      process.exit(1);
+    });
+
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`Node.js demo server escuchando en 0.0.0.0:${PORT}`);
+    });
+
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+      console.log('SIGTERM recibido, cerrando servidor...');
+      server.close(() => process.exit(0));
+    });
+
+---
+# -----------------------------------------------------------------------------
+# 3. Deployment — 3 replicas
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-app
+  namespace: node-demo
+  labels:
+    app: node-app
+    app.kubernetes.io/name: node-app
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: node-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: node-app
+        version: "1.0.0"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: node-app
+          image: node:20-slim
+          imagePullPolicy: IfNotPresent
+
+          command: ["node", "/app/server.js"]
+
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: production
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+
+      volumes:
+        - name: app-code
+          configMap:
+            name: node-app-code
+
+---
+# -----------------------------------------------------------------------------
+# 4. Service
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-app
+  namespace: node-demo
+  labels:
+    app: node-app
+spec:
+  selector:
+    app: node-app
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+
+---
+# -----------------------------------------------------------------------------
+# 5. Route
+# -----------------------------------------------------------------------------
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: node-app
+  namespace: node-demo
+  labels:
+    app: node-app
+spec:
+  to:
+    kind: Service
+    name: node-app
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

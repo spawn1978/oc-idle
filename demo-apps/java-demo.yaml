@@ -1,0 +1,274 @@
+# =============================================================================
+# demo-apps/java-demo.yaml
+# Proyecto: java-demo | 1 pod | Java 21 con com.sun.net.httpserver
+#
+# Estrategia: initContainer compila HelloServer.java desde un ConfigMap
+# y deja el .class en un emptyDir; el contenedor principal lo ejecuta.
+# Sin necesidad de imagen custom ni Maven/Gradle.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Namespace
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: java-demo
+  labels:
+    app.kubernetes.io/managed-by: demo-apps
+    idle-ops/managed: "true"
+
+---
+# -----------------------------------------------------------------------------
+# 2. Codigo fuente Java
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: java-app-source
+  namespace: java-demo
+  labels:
+    app: java-app
+data:
+  HelloServer.java: |
+    import com.sun.net.httpserver.HttpExchange;
+    import com.sun.net.httpserver.HttpHandler;
+    import com.sun.net.httpserver.HttpServer;
+
+    import java.io.IOException;
+    import java.io.OutputStream;
+    import java.net.InetSocketAddress;
+    import java.nio.charset.StandardCharsets;
+    import java.time.Instant;
+
+    /**
+     * Demo HTTP server — sin dependencias externas.
+     * Usa unicamente la API HttpServer incluida en el JDK.
+     */
+    public class HelloServer {
+
+        private static final int PORT =
+            Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
+
+        public static void main(String[] args) throws IOException {
+            HttpServer server = HttpServer.create(
+                new InetSocketAddress("0.0.0.0", PORT), 0
+            );
+
+            server.createContext("/", new DemoHandler());
+
+            // Graceful shutdown con SIGTERM
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                System.out.println("SIGTERM recibido, cerrando servidor...");
+                server.stop(2);
+            }));
+
+            server.start();
+            System.out.println("Java demo server escuchando en 0.0.0.0:" + PORT);
+        }
+
+        static class DemoHandler implements HttpHandler {
+            @Override
+            public void handle(HttpExchange exchange) throws IOException {
+                String hostname = System.getenv().getOrDefault("HOSTNAME", "unknown");
+                String path     = exchange.getRequestURI().getPath();
+                String version  = System.getProperty("java.version", "unknown");
+
+                String body = String.join("\n",
+                    "{",
+                    "  \"app\": \"java-demo\",",
+                    "  \"version\": \"1.0.0\",",
+                    "  \"language\": \"Java " + version + "\",",
+                    "  \"message\": \"Hola desde Java!\",",
+                    "  \"hostname\": \"" + hostname + "\",",
+                    "  \"path\": \"" + path + "\",",
+                    "  \"timestamp\": \"" + Instant.now() + "\"",
+                    "}"
+                );
+
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type",
+                    "application/json; charset=utf-8");
+                exchange.sendResponseHeaders(200, bytes.length);
+
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+
+                System.out.printf("[%s] %s %s - 200%n",
+                    Instant.now(), exchange.getRequestMethod(), path);
+            }
+        }
+    }
+
+---
+# -----------------------------------------------------------------------------
+# 3. Deployment — 1 replica
+#
+# initContainer: compila HelloServer.java -> /compiled/HelloServer.class
+# Main container: java -cp /compiled HelloServer
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: java-app
+  namespace: java-demo
+  labels:
+    app: java-app
+    app.kubernetes.io/name: java-app
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: java-app
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: java-app
+        version: "1.0.0"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      # --- initContainer: compila el fuente ---
+      initContainers:
+        - name: javac
+          image: eclipse-temurin:21-jdk-alpine
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - sh
+            - -c
+            - |
+              echo "Compilando HelloServer.java..."
+              javac -source 11 -target 11 -d /compiled /src/HelloServer.java \
+                && echo "Compilacion exitosa." \
+                || { echo "Error de compilacion" >&2; exit 1; }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          volumeMounts:
+            - name: java-source
+              mountPath: /src
+              readOnly: true
+            - name: java-compiled
+              mountPath: /compiled
+
+      # --- Contenedor principal: ejecuta el .class compilado ---
+      containers:
+        - name: java-app
+          image: eclipse-temurin:21-jre-alpine
+          imagePullPolicy: IfNotPresent
+
+          command: ["java", "-cp", "/compiled", "HelloServer"]
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: "8080"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+          volumeMounts:
+            - name: java-compiled
+              mountPath: /compiled
+              readOnly: true
+
+      volumes:
+        - name: java-source
+          configMap:
+            name: java-app-source
+        - name: java-compiled
+          emptyDir: {}
+
+---
+# -----------------------------------------------------------------------------
+# 4. Service
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: java-app
+  namespace: java-demo
+  labels:
+    app: java-app
+spec:
+  selector:
+    app: java-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+
+---
+# -----------------------------------------------------------------------------
+# 5. Route
+# -----------------------------------------------------------------------------
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: java-app
+  namespace: java-demo
+  labels:
+    app: java-app
+spec:
+  to:
+    kind: Service
+    name: java-app
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
