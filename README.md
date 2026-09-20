@@ -229,7 +229,7 @@ spec:
       storage: 1Gi
 ```
 
-**Crítico para el funcionamiento del rollback.** Los pods de un CronJob son efímeros; sin este PVC, cada ejecución destruiría el historial de snapshots y el rollback sería imposible.
+> ⚠️ **CRÍTICO para el funcionamiento del rollback.** Los pods de un CronJob son efímeros; sin este PVC, cada ejecución destruiría el historial de snapshots y el rollback sería imposible.
 
 El PVC se monta en `/data` dentro del pod y contiene:
 

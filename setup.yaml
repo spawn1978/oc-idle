@@ -145,9 +145,12 @@ subjects:
 ---
 # -----------------------------------------------------------------------------
 # 5. PersistentVolumeClaim
+#
+# !!! CRITICO PARA EL FUNCIONAMIENTO DEL ROLLBACK !!!
+#
 # Almacena los snapshots de estado y los logs entre ejecuciones del CronJob.
-# Sin esto, cada pod del CronJob seria efimero y no habria historial para
-# el rollback.
+# Sin este PVC, cada pod del CronJob seria efimero: los archivos .state y .log
+# se perderian al terminar cada ejecucion y el rollback seria imposible.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: PersistentVolumeClaim
