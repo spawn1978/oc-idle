@@ -1,0 +1,455 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: idle-manager-script
+  namespace: idle-ops
+  labels:
+    app.kubernetes.io/name: idle-manager
+data:
+  projects.txt: |
+    # Lista de proyectos a poner en idle
+    # Un proyecto por linea. Las lineas que comienzan con # se ignoran.
+    # Tambien se ignoran lineas en blanco y espacios.
+
+    # Ejemplo:
+    # my-app-dev
+    # my-app-staging
+    # ecommerce-qa
+    python-demo
+    node-demo
+    java-demo
+
+  oc-idle-manager.sh: |
+    #!/usr/bin/env bash
+    # oc-idle-manager.sh
+    # Idle and rollback OpenShift services using `oc idle`
+    # Requires: oc >= 4.18, bash >= 4
+    set -euo pipefail
+
+    # ---------------------------------------------------------------------------
+    # Configuration (override via environment variables)
+    # ---------------------------------------------------------------------------
+    STATE_DIR="${OC_IDLE_STATE_DIR:-${HOME}/.oc-idle-manager/states}"
+    LOG_DIR="${OC_IDLE_LOG_DIR:-${HOME}/.oc-idle-manager/logs}"
+
+    SCRIPT_NAME="$(basename "$0")"
+    TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$STATE_DIR" "$LOG_DIR"
+    LOG_FILE="${LOG_DIR}/oc-idle-manager_${TIMESTAMP}.log"
+
+    # ---------------------------------------------------------------------------
+    # Logging helpers
+    # ---------------------------------------------------------------------------
+    _log() {
+        local level="$1"; shift
+        local line="[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*"
+        echo "$line" | tee -a "$LOG_FILE"
+    }
+    log_info()    { _log "INFO " "$@"; }
+    log_warn()    { _log "WARN " "$@"; }
+    log_error()   { _log "ERROR" "$@"; }
+    log_ok()      { _log "OK   " "$@"; }
+    log_section() { _log "===  " "--- $* ---"; }
+    log_dry()     { _log "DRY  " "$@"; }
+
+    die() { log_error "$*"; exit 1; }
+
+    # ---------------------------------------------------------------------------
+    # Usage
+    # ---------------------------------------------------------------------------
+    usage() {
+        cat <<EOF
+    Usage: $SCRIPT_NAME <action> [options]
+
+    Actions:
+      idle      Put services in one or more projects into idle state
+      rollback  Restore projects to their pre-idle state
+
+    Options:
+      -p, --project  <name>    Single project (namespace) name
+      -P, --projects <list>    Comma-separated list of projects
+      -f, --file     <path>    File with one project name per line (# lines ignored)
+      -s, --services <list>    Comma-separated list of services to idle
+                               (default: all services in each namespace)
+          --state-id <id>      Timestamp ID of the snapshot to use for rollback
+                               (default: latest snapshot for each project)
+      -d, --dry-run            Print what would be done without making changes
+      -h, --help               Show this help
+
+    State files:
+      Saved under: $STATE_DIR
+      Each snapshot: <project>_<YYYYMMDD_HHMMSS>.state
+
+    Logs:
+      Written to: $LOG_DIR
+
+    Examples:
+      # Idle all services in a single project
+      $SCRIPT_NAME idle -p my-project
+
+      # Idle specific services
+      $SCRIPT_NAME idle -p my-project -s frontend,backend
+
+      # Idle all projects listed in a file
+      $SCRIPT_NAME idle -f projects.txt
+
+      # Dry-run over several projects
+      $SCRIPT_NAME idle -P proj-a,proj-b,proj-c --dry-run
+
+      # Rollback a project to its latest saved state
+      $SCRIPT_NAME rollback -p my-project
+
+      # Rollback multiple projects to a specific snapshot
+      $SCRIPT_NAME rollback -P proj-a,proj-b --state-id 20240101_120000
+
+      # List available state snapshots
+      ls $STATE_DIR
+    EOF
+    }
+
+    # ---------------------------------------------------------------------------
+    # Argument parsing
+    # ---------------------------------------------------------------------------
+    ACTION=""
+    OPT_PROJECTS=()
+    OPT_FILE=""
+    OPT_SERVICES=()
+    OPT_STATE_ID=""
+    DRY_RUN=false
+
+    parse_args() {
+        [[ $# -eq 0 ]] && { usage; exit 0; }
+
+        ACTION="$1"; shift
+
+        case "$ACTION" in
+            idle|rollback) ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown action '$ACTION'. Use 'idle' or 'rollback'." ;;
+        esac
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p|--project)
+                    [[ $# -lt 2 ]] && die "$1 requires an argument"
+                    OPT_PROJECTS+=("$2"); shift 2 ;;
+                -P|--projects)
+                    [[ $# -lt 2 ]] && die "$1 requires an argument"
+                    IFS=',' read -ra _parts <<< "$2"
+                    OPT_PROJECTS+=("${_parts[@]}"); shift 2 ;;
+                -f|--file)
+                    [[ $# -lt 2 ]] && die "$1 requires an argument"
+                    OPT_FILE="$2"; shift 2 ;;
+                -s|--services)
+                    [[ $# -lt 2 ]] && die "$1 requires an argument"
+                    IFS=',' read -ra _parts <<< "$2"
+                    OPT_SERVICES+=("${_parts[@]}"); shift 2 ;;
+                --state-id)
+                    [[ $# -lt 2 ]] && die "$1 requires an argument"
+                    OPT_STATE_ID="$2"; shift 2 ;;
+                -d|--dry-run)
+                    DRY_RUN=true; shift ;;
+                -h|--help)
+                    usage; exit 0 ;;
+                *)
+                    die "Unknown option: $1" ;;
+            esac
+        done
+
+        # Load projects from file
+        if [[ -n "$OPT_FILE" ]]; then
+            [[ -f "$OPT_FILE" ]] || die "Projects file not found: $OPT_FILE"
+            while IFS= read -r line; do
+                line="${line%%#*}"        # strip inline comments
+                line="${line// /}"        # strip spaces
+                [[ -n "$line" ]] && OPT_PROJECTS+=("$line")
+            done < "$OPT_FILE"
+        fi
+
+        if [[ ${#OPT_PROJECTS[@]} -eq 0 ]]; then
+            die "No projects specified. Use -p, -P or -f."
+        fi
+    }
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+    run_oc() {
+        # Wrapper: logs and respects dry-run for write operations
+        # First arg is either "ro" (read-only) or "rw" (mutating)
+        local mode="$1"; shift
+        if [[ "$mode" == "rw" && "$DRY_RUN" == "true" ]]; then
+            log_dry "oc $*"
+            return 0
+        fi
+        log_info "oc $*"
+        oc "$@" 2>&1 | tee -a "$LOG_FILE" || return $?
+    }
+
+    require_oc() {
+        command -v oc &>/dev/null || die "'oc' not found in PATH"
+
+        # In-cluster: ServiceAccount token is auto-mounted; oc detects it automatically.
+        # We just verify the connection works.
+        local IN_CLUSTER_TOKEN="/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if [[ -f "$IN_CLUSTER_TOKEN" ]]; then
+            local sa_ns
+            sa_ns="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo unknown)"
+            log_info "In-cluster mode | namespace: $sa_ns"
+        fi
+
+        oc whoami &>/dev/null || die "Not authenticated. Outside a pod run 'oc login' first."
+        log_info "Authenticated as: $(oc whoami) | Server: $(oc whoami --show-server)"
+    }
+
+    project_exists() {
+        oc get project "$1" &>/dev/null
+    }
+
+    state_file_path() {
+        local project="$1" ts="$2"
+        echo "${STATE_DIR}/${project}_${ts}.state"
+    }
+
+    latest_state_file() {
+        local project="$1"
+        # Returns the most recent .state file for the project, or empty string
+        ls -1 "${STATE_DIR}/${project}_"*.state 2>/dev/null | sort -r | head -n1 || true
+    }
+
+    # ---------------------------------------------------------------------------
+    # Save project state
+    # Returns the path to the state file written
+    # ---------------------------------------------------------------------------
+    save_state() {
+        local project="$1"
+        local state_file
+        state_file="$(state_file_path "$project" "$TIMESTAMP")"
+
+        log_info "[$project] Saving current workload state -> $state_file"
+
+        {
+            echo "# oc-idle-manager state snapshot"
+            echo "# project:   $project"
+            echo "# timestamp: $TIMESTAMP"
+            echo "# saved_at:  $(date --iso-8601=seconds)"
+            echo "#"
+            echo "# format: <kind> <name> <replicas>"
+            echo ""
+
+            # Deployments
+            local deploys
+            deploys="$(oc get deployments -n "$project" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' \
+                2>/dev/null || true)"
+            if [[ -n "$deploys" ]]; then
+                while IFS=$'\t' read -r name replicas; do
+                    [[ -z "$name" ]] && continue
+                    echo "deploy ${name} ${replicas:-0}"
+                    log_info "[$project]   deploy/$name -> replicas=${replicas:-0}"
+                done <<< "$deploys"
+            fi
+
+            # DeploymentConfigs (still common in OCP 4.x)
+            local dcs
+            dcs="$(oc get deploymentconfigs -n "$project" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' \
+                2>/dev/null || true)"
+            if [[ -n "$dcs" ]]; then
+                while IFS=$'\t' read -r name replicas; do
+                    [[ -z "$name" ]] && continue
+                    echo "dc ${name} ${replicas:-0}"
+                    log_info "[$project]   dc/$name -> replicas=${replicas:-0}"
+                done <<< "$dcs"
+            fi
+
+            # StatefulSets
+            local stss
+            stss="$(oc get statefulsets -n "$project" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.replicas}{"\n"}{end}' \
+                2>/dev/null || true)"
+            if [[ -n "$stss" ]]; then
+                while IFS=$'\t' read -r name replicas; do
+                    [[ -z "$name" ]] && continue
+                    echo "sts ${name} ${replicas:-0}"
+                    log_info "[$project]   sts/$name -> replicas=${replicas:-0}"
+                done <<< "$stss"
+            fi
+
+        } > "$state_file"
+
+        log_ok "[$project] State saved: $state_file"
+        echo "$state_file"
+    }
+
+    # ---------------------------------------------------------------------------
+    # Idle a single project
+    # ---------------------------------------------------------------------------
+    idle_project() {
+        local project="$1"
+        log_section "Idling project: $project"
+
+        if ! project_exists "$project"; then
+            log_error "[$project] Project not found, skipping."
+            return 1
+        fi
+
+        # Save state before any changes
+        save_state "$project"
+
+        # Build service list
+        local services=()
+        if [[ ${#OPT_SERVICES[@]} -gt 0 ]]; then
+            services=("${OPT_SERVICES[@]}")
+            log_info "[$project] Target services: ${services[*]}"
+        else
+            # Get all services in the namespace
+            local all_svcs
+            all_svcs="$(oc get services -n "$project" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                2>/dev/null || true)"
+            while IFS= read -r svc; do
+                [[ -n "$svc" ]] && services+=("$svc")
+            done <<< "$all_svcs"
+            log_info "[$project] Found ${#services[@]} service(s)"
+        fi
+
+        if [[ ${#services[@]} -eq 0 ]]; then
+            log_warn "[$project] No services found, nothing to idle."
+            return 0
+        fi
+
+        # Run oc idle for each service
+        local failed=0
+        for svc in "${services[@]}"; do
+            log_info "[$project] Idling service: $svc"
+            if run_oc rw idle -n "$project" "$svc"; then
+                log_ok "[$project] Service '$svc' idled successfully"
+            else
+                log_error "[$project] Failed to idle service '$svc'"
+                (( failed++ )) || true
+            fi
+        done
+
+        if [[ $failed -gt 0 ]]; then
+            log_warn "[$project] Idling completed with $failed error(s)"
+        else
+            log_ok "[$project] All services idled successfully"
+        fi
+    }
+
+    # ---------------------------------------------------------------------------
+    # Rollback a single project
+    # ---------------------------------------------------------------------------
+    rollback_project() {
+        local project="$1"
+        log_section "Rolling back project: $project"
+
+        if ! project_exists "$project"; then
+            log_error "[$project] Project not found, skipping."
+            return 1
+        fi
+
+        # Locate state file
+        local state_file=""
+        if [[ -n "$OPT_STATE_ID" ]]; then
+            state_file="$(state_file_path "$project" "$OPT_STATE_ID")"
+            if [[ ! -f "$state_file" ]]; then
+                log_error "[$project] State file not found: $state_file"
+                return 1
+            fi
+        else
+            state_file="$(latest_state_file "$project")"
+            if [[ -z "$state_file" ]]; then
+                log_error "[$project] No state snapshots found in $STATE_DIR"
+                log_error "[$project] Run 'idle' first to create a snapshot, or specify --state-id"
+                return 1
+            fi
+        fi
+
+        log_info "[$project] Using state snapshot: $state_file"
+
+        # Parse state file and scale workloads back
+        local failed=0
+        while IFS=' ' read -r kind name replicas; do
+            # Skip comments and empty lines
+            [[ "$kind" =~ ^#.*$ || -z "$kind" ]] && continue
+
+            local resource=""
+            case "$kind" in
+                deploy) resource="deployment/${name}" ;;
+                dc)     resource="deploymentconfig/${name}" ;;
+                sts)    resource="statefulset/${name}" ;;
+                *)
+                    log_warn "[$project] Unknown resource kind '$kind' in state file, skipping."
+                    continue ;;
+            esac
+
+            log_info "[$project] Scaling $resource to $replicas replica(s)"
+
+            if run_oc rw scale -n "$project" "$resource" --replicas="$replicas"; then
+                log_ok "[$project] $resource scaled to $replicas"
+            else
+                log_error "[$project] Failed to scale $resource"
+                (( failed++ )) || true
+            fi
+
+        done < "$state_file"
+
+        if [[ $failed -gt 0 ]]; then
+            log_warn "[$project] Rollback completed with $failed error(s)"
+        else
+            log_ok "[$project] Rollback completed successfully"
+        fi
+    }
+
+    # ---------------------------------------------------------------------------
+    # Main
+    # ---------------------------------------------------------------------------
+    main() {
+        parse_args "$@"
+
+        log_section "oc-idle-manager start"
+        log_info "Action:    $ACTION"
+        log_info "Projects:  ${OPT_PROJECTS[*]}"
+        log_info "Dry-run:   $DRY_RUN"
+        log_info "Log file:  $LOG_FILE"
+        log_info "State dir: $STATE_DIR"
+        [[ -n "$OPT_STATE_ID" ]]        && log_info "State ID:  $OPT_STATE_ID"  || true
+        [[ ${#OPT_SERVICES[@]} -gt 0 ]] && log_info "Services:  ${OPT_SERVICES[*]}" || true
+
+        require_oc
+
+        local total=0 ok=0 err=0
+        for project in "${OPT_PROJECTS[@]}"; do
+            (( total++ )) || true
+            if [[ "$ACTION" == "idle" ]]; then
+                if idle_project "$project"; then
+                    (( ok++ )) || true
+                else
+                    (( err++ )) || true
+                fi
+            else
+                if rollback_project "$project"; then
+                    (( ok++ )) || true
+                else
+                    (( err++ )) || true
+                fi
+            fi
+        done
+
+        log_section "Summary"
+        log_info "Total projects processed: $total"
+        log_ok   "Succeeded: $ok"
+        if [[ $err -gt 0 ]]; then
+            log_error "Failed:    $err"
+        fi
+        log_info "Full log: $LOG_FILE"
+
+        if [[ $err -gt 0 ]]; then
+            exit 1
+        fi
+        exit 0
+    }
+
+    main "$@"

@@ -1,0 +1,58 @@
+# Pod temporal para inspeccionar el contenido del PVC idle-manager-data.
+# Uso:
+#   oc apply -f idle-ops/debug-pvc.yaml -n idle-ops
+#   # esperar a que termine (Complete)
+#   oc logs pod/pvc-check -n idle-ops
+#   oc delete pod/pvc-check -n idle-ops
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pvc-check
+  namespace: idle-ops
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== /data/logs ==="
+          ls -la /data/logs/ 2>/dev/null || echo "(directorio no existe)"
+          echo ""
+          echo "=== /data/states ==="
+          ls -la /data/states/ 2>/dev/null || echo "(directorio no existe)"
+          echo ""
+          echo "=== debug.log (job de diagnostico) ==="
+          if [ -f /data/debug.log ]; then
+            cat /data/debug.log
+          else
+            echo "(no existe /data/debug.log)"
+          fi
+          echo ""
+          echo "=== contenido de logs ==="
+          found=0
+          for f in /data/logs/*.log; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "--- $f ---"
+            cat "$f"
+            echo ""
+          done
+          [ "$found" = "0" ] && echo "(no hay archivos .log)"
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: idle-manager-data

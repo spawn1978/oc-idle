@@ -1,0 +1,78 @@
+# Job de diagnóstico: corre el script con bash -x y guarda todo en /data/debug.log
+# Uso (desde dentro de idle-ops/):
+#   oc apply -f debug-job.yaml
+#   # esperar que Complete o Error (~5s)
+#   oc apply -f debug-pvc.yaml   (muestra el contenido del PVC incluyendo debug.log)
+#
+# Limpieza:
+#   oc delete job/idle-debug-job -n idle-ops
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: idle-debug-job
+  namespace: idle-ops
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: idle-manager
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: debug
+          image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+          command:
+            - bash
+            - -c
+            - |
+              OUT=/data/debug.log
+              {
+                echo "=== UID/GID ==="
+                id
+                echo ""
+                echo "=== Write test en /data ==="
+                touch /data/write-test && echo "OK" && rm /data/write-test || echo "FALLO escritura en /data"
+                echo ""
+                echo "=== Write test en /data/logs ==="
+                touch /data/logs/write-test && echo "OK" && rm /data/logs/write-test || echo "FALLO escritura en /data/logs"
+                echo ""
+                echo "=== Contenido de /scripts ==="
+                ls -la /scripts/
+                echo ""
+                echo "=== Primeras lineas de projects.txt ==="
+                cat /scripts/projects.txt
+                echo ""
+                echo "=== oc whoami ==="
+                oc whoami || echo "FALLO oc whoami"
+                echo ""
+                echo "=== Script con bash -x ==="
+              } 2>&1 | tee "$OUT"
+              bash -x /scripts/oc-idle-manager.sh idle -f /scripts/projects.txt >> "$OUT" 2>&1 || true
+              echo "=== FIN (exit ignorado para poder leer el log) ===" >> "$OUT"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: OC_IDLE_STATE_DIR
+              value: /data/states
+            - name: OC_IDLE_LOG_DIR
+              value: /data/logs
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: scripts
+          configMap:
+            name: idle-manager-script
+            defaultMode: 0555
+        - name: data
+          persistentVolumeClaim:
+            claimName: idle-manager-data

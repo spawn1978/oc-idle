@@ -1,0 +1,11 @@
+# Lista de proyectos a poner en idle
+# Un proyecto por linea. Las lineas que comienzan con # se ignoran.
+# Tambien se ignoran lineas en blanco y espacios.
+
+# Ejemplo:
+# my-app-dev
+# my-app-staging
+# ecommerce-qa
+python-demo
+node-demo
+java-demo

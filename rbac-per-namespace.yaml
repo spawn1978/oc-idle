@@ -1,0 +1,85 @@
+# =============================================================================
+# idle-ops/rbac-per-namespace.yaml
+#
+# OPCION B — RBAC de least-privilege: RoleBinding por namespace.
+#
+# En lugar del ClusterRoleBinding de setup.yaml (que otorga acceso a TODOS
+# los namespaces del cluster), esta alternativa crea un RoleBinding en cada
+# namespace target, limitando el SA a actuar solo sobre los proyectos listados.
+#
+# Cuando usar esta opcion:
+#   - Ambientes con auditorias de seguridad estrictas
+#   - Cuando la lista de proyectos es fija y conocida de antemano
+#   - Para cumplir con politicas de least-privilege corporativas
+#
+# Limitacion:
+#   Agregar un proyecto nuevo a projects.txt requiere crear tambien
+#   un RoleBinding aqui y reaplicar este archivo ANTES de la siguiente
+#   ejecucion del CronJob, o el Job fallara con Forbidden.
+#
+# Como migrar desde la Opcion A (ClusterRoleBinding):
+#   1. Eliminar el ClusterRoleBinding existente:
+#        oc delete clusterrolebinding idle-manager
+#   2. Agregar un bloque RoleBinding por cada proyecto en projects.txt
+#   3. Aplicar este archivo:
+#        oc apply -f idle-ops/rbac-per-namespace.yaml
+#   4. Verificar permisos en cada namespace:
+#        oc auth can-i idle services \
+#          --as=system:serviceaccount:idle-ops:idle-manager \
+#          -n <proyecto-target>
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Proyecto: my-app-dev
+#
+# Este RoleBinding otorga al SA idle-manager (que vive en idle-ops) los
+# permisos del ClusterRole idle-manager SOLO dentro del namespace my-app-dev.
+# El ClusterRole es reutilizado como referencia; no se crean permisos nuevos.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: idle-manager-from-idle-ops
+  # IMPORTANTE: este es el namespace TARGET (el proyecto a gestionar),
+  # no el namespace donde vive el SA (idle-ops)
+  namespace: my-app-dev
+  labels:
+    app.kubernetes.io/name: idle-manager
+    app.kubernetes.io/managed-by: idle-ops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole          # reutiliza el ClusterRole definido en setup.yaml
+  name: idle-manager
+subjects:
+  - kind: ServiceAccount
+    name: idle-manager
+    namespace: idle-ops      # el SA vive en idle-ops, no en el namespace target
+
+---
+# -----------------------------------------------------------------------------
+# Proyecto: my-app-staging
+# Duplicar este bloque por cada proyecto adicional en projects.txt.
+# Solo cambiar: metadata.namespace
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: idle-manager-from-idle-ops
+  namespace: my-app-staging
+  labels:
+    app.kubernetes.io/name: idle-manager
+    app.kubernetes.io/managed-by: idle-ops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: idle-manager
+subjects:
+  - kind: ServiceAccount
+    name: idle-manager
+    namespace: idle-ops
+
+---
+# Agregar un bloque por cada proyecto adicional en projects.txt.
+# Solo cambiar el campo: metadata.namespace: <nombre-del-proyecto>
+# El nombre del RoleBinding (idle-manager-from-idle-ops) debe ser identico
+# en todos los namespaces — es el nombre dentro de cada namespace, no global.

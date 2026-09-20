@@ -1,0 +1,295 @@
+# =============================================================================
+# idle-ops/setup.yaml
+# Todos los recursos OpenShift necesarios para ejecutar oc-idle-manager
+# como CronJob en el proyecto idle-ops.
+#
+# Aplicar con:
+#   oc apply -f setup.yaml
+#
+# Para cargar o actualizar el script y la lista de proyectos:
+#   oc create configmap idle-manager-script \
+#       --from-file=oc-idle-manager.sh=../oc-idle-manager.sh \
+#       --from-file=projects.txt=projects.txt \
+#       -n idle-ops --dry-run=client -o yaml | oc apply -f -
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Namespace
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: idle-ops
+  labels:
+    app.kubernetes.io/managed-by: idle-ops
+
+---
+# -----------------------------------------------------------------------------
+# 2. ServiceAccount
+# El CronJob corre bajo esta identidad.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: idle-manager
+  namespace: idle-ops
+  labels:
+    app.kubernetes.io/name: idle-manager
+    app.kubernetes.io/component: cronjob
+
+---
+# -----------------------------------------------------------------------------
+# 3. ClusterRole
+# Permisos minimos para que `oc idle` y el rollback funcionen en cualquier
+# namespace del cluster.
+#
+# NOTA DE SEGURIDAD:
+#   Este ClusterRole otorga acceso a TODOS los namespaces cuando se enlaza
+#   con un ClusterRoleBinding (ver seccion 4a).
+#   Si solo necesitas actuar sobre proyectos especificos, usa en cambio
+#   RoleBindings por namespace (ver seccion 4b en rbac-per-namespace.yaml).
+#
+# VERIFICACION DE PERMISOS:
+#   oc auth can-i idle services \
+#     --as=system:serviceaccount:idle-ops:idle-manager \
+#     -n <proyecto-target>
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: idle-manager
+  labels:
+    app.kubernetes.io/name: idle-manager
+rules:
+  # Leer namespaces y proyectos OCP para validar que existen antes de operar
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: ["project.openshift.io"]
+    resources: ["projects"]
+    verbs: ["get", "list"]
+
+  # Services: el verbo "idle" es especifico de OpenShift y es requerido por
+  # `oc idle` ademas de los verbos estandar de lectura/escritura.
+  # Sin el verbo "idle", el comando falla con Forbidden aunque tenga patch/update.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "update", "patch", "idle"]
+
+  # Pods: oc idle los lee para identificar el controlador (Deployment/RC)
+  # que respalda cada pod asociado al Service. Sin este permiso el comando
+  # falla con "unable to find controller for pod ... is forbidden"
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+  # Endpoints: oc idle los lee para descubrir los workloads que respaldan
+  # cada Service y los anota con la metadata de idling
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # EndpointSlices: en OCP 4.18+ oc idle usa EndpointSlices ademas de Endpoints
+  # para resolver los workloads backing; sin este permiso puede fallar
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+
+  # ReplicationControllers: backing de DeploymentConfigs legacy (OCP 3/4 compat)
+  # Se necesitan para guardar replicas en el snapshot y restaurarlas en rollback
+  - apiGroups: [""]
+    resources: ["replicationcontrollers", "replicationcontrollers/scale"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # Deployments, ReplicaSets y StatefulSets: workloads modernos
+  # El subrecurso /scale se usa en el rollback para restaurar replicas exactas
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - deployments/scale
+      - replicasets
+      - statefulsets
+      - statefulsets/scale
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # DeploymentConfigs: tipo de recurso nativo de OpenShift (no existe en vanilla k8s)
+  # Aun comun en clusters OCP 4.x migrados desde OCP 3.x
+  - apiGroups: ["apps.openshift.io"]
+    resources:
+      - deploymentconfigs
+      - deploymentconfigs/scale
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+---
+# -----------------------------------------------------------------------------
+# 4a. ClusterRoleBinding — acceso a TODOS los namespaces (opcion simple)
+#
+# Usar esta opcion si los proyectos a gestionar son dinamicos o muchos.
+# Comentar esta seccion y usar los RoleBindings de 4b para least-privilege.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: idle-manager
+  labels:
+    app.kubernetes.io/name: idle-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: idle-manager
+subjects:
+  - kind: ServiceAccount
+    name: idle-manager
+    namespace: idle-ops
+
+---
+# -----------------------------------------------------------------------------
+# 5. PersistentVolumeClaim
+# Almacena los snapshots de estado y los logs entre ejecuciones del CronJob.
+# Sin esto, cada pod del CronJob seria efimero y no habria historial para
+# el rollback.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: idle-manager-data
+  namespace: idle-ops
+  labels:
+    app.kubernetes.io/name: idle-manager
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Descomentar si el cluster tiene una StorageClass especifica:
+  # storageClassName: gp3-csi
+
+---
+# -----------------------------------------------------------------------------
+# 6. CronJob
+#
+# Imagen: registry interna del cluster (openshift/cli).
+#   - Multi-arch: amd64, arm64, s390x, ppc64le
+#   - Siempre compatible con la version del cluster
+#   - No requiere pull secret externo
+#   - Accesible desde cualquier namespace por defecto
+#
+# Alternativas (requieren pull secret o build manual):
+#   registry.redhat.io/openshift4/ose-cli-rhel9:v4.18  (RH registry, multi-arch)
+#   quay.io/openshift/origin-cli:4.18                  (solo amd64)
+#
+# Ajustar el schedule segun necesidad. Ejemplos:
+#   "0 20 * * 1-5"   -> lunes a viernes a las 20:00
+#   "0 22 * * *"     -> todos los dias a las 22:00
+#   "0 0 * * 6,0"    -> sabados y domingos a medianoche
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: idle-manager
+  namespace: idle-ops
+  labels:
+    app.kubernetes.io/name: idle-manager
+    app.kubernetes.io/component: cronjob
+spec:
+  # --- Horario ---
+  schedule: "0 20 * * 1-5"
+  timeZone: "America/Argentina/Buenos_Aires"
+
+  # --- Politica de concurrencia ---
+  # Forbid: no lanza un nuevo Job si el anterior sigue corriendo
+  concurrencyPolicy: Forbid
+
+  # Cuantos Jobs finalizados conservar en historial
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+
+  jobTemplate:
+    spec:
+      # Sin reintentos automaticos: el script maneja sus propios errores por
+      # proyecto y reporta el resultado en el log. Un reintento automatico
+      # podria hacer idle dos veces sobreescribiendo el snapshot de estado.
+      backoffLimit: 0
+
+      # Timeout maximo del Job completo. Si el script no termina en 1 hora,
+      # Kubernetes mata el pod y marca el Job como Failed. Evita que una
+      # ejecucion colgada bloquee el schedule de la noche siguiente.
+      activeDeadlineSeconds: 3600
+
+      # El pod permanece disponible 24 horas despues de terminar (exito o fallo).
+      # Esto permite leer los logs aunque CRI-O haya limpiado el contenedor
+      # internamente (error: "unable to retrieve container logs for cri-o://...").
+      # Sin este parametro, el pod se elimina inmediatamente y los logs se pierden.
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: idle-manager
+        spec:
+          serviceAccountName: idle-manager
+          restartPolicy: Never
+
+          # Security context compatible con SCC restricted-v2 de OCP 4.18+
+          #
+          # fsGroup: el kubelet aplica este GID al volumen montado (PVC), haciendo
+          # que el directorio raiz sea escribible para el proceso del contenedor.
+          # Sin este campo, el proceso no puede crear archivos en el PVC aunque el
+          # directorio muestre el GID correcto en `ls -la`.
+          # Valor: primer GID del rango asignado al namespace idle-ops
+          # (openshift.io/sa.scc.supplemental-groups: 1000710000/10000)
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 1000710000
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: idle-manager
+              image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+              imagePullPolicy: IfNotPresent
+
+              command: ["/bin/bash", "/scripts/oc-idle-manager.sh"]
+              args:
+                - "idle"
+                - "-f"
+                - "/scripts/projects.txt"
+
+              # Para rollback manual (lanzar Job ad-hoc):
+              # args: ["rollback", "-f", "/scripts/projects.txt"]
+              # args: ["rollback", "-p", "mi-proyecto", "--state-id", "20240901_200000"]
+
+              env:
+                - name: OC_IDLE_STATE_DIR
+                  value: /data/states
+                - name: OC_IDLE_LOG_DIR
+                  value: /data/logs
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: data
+                  mountPath: /data
+
+          volumes:
+            - name: scripts
+              configMap:
+                name: idle-manager-script
+                defaultMode: 0555    # ejecutable
+            - name: data
+              persistentVolumeClaim:
+                claimName: idle-manager-data
