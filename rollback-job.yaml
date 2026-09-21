@@ -70,8 +70,8 @@ spec:
           # --- Editar los args según el caso de uso (ver comentarios arriba) ---
           args:
             - "rollback"
-            - "-p"
-            - "node-demo"
+            - "-P"
+            - "python-demo,node-demo"
 
           env:
             - name: OC_IDLE_STATE_DIR
