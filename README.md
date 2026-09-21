@@ -673,6 +673,9 @@ args:
 ### Paso 3 — Ejecutar el rollback
 
 ```bash
+# Eliminar el Job anterior si existe (el pod template es inmutable)
+oc delete job/idle-rollback -n idle-ops --ignore-not-found
+
 oc apply -f rollback-job.yaml
 ```
 

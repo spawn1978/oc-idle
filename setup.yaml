@@ -233,17 +233,17 @@ spec:
           serviceAccountName: idle-manager
           restartPolicy: Never
 
-          # Security context compatible con SCC restricted-v2 de OCP 4.18+
+          # Security context compatible con SCC restricted-v2/v3 de OCP 4.18+
           #
-          # fsGroup: el kubelet aplica este GID al volumen montado (PVC), haciendo
-          # que el directorio raiz sea escribible para el proceso del contenedor.
-          # Sin este campo, el proceso no puede crear archivos en el PVC aunque el
-          # directorio muestre el GID correcto en `ls -la`.
-          # Valor: primer GID del rango asignado al namespace idle-ops
-          # (openshift.io/sa.scc.supplemental-groups: 1000710000/10000)
+          # fsGroup NO se especifica: OpenShift lo asigna automaticamente desde
+          # el rango del namespace (openshift.io/sa.scc.supplemental-groups).
+          # Especificarlo explicitamente viola la validacion de restricted-v2/v3
+          # aunque el valor este dentro del rango permitido.
+          #
+          # hostUsers: false es requerido por restricted-v3 (OCP 4.15+)
           securityContext:
             runAsNonRoot: true
-            fsGroup: 1000710000
+            hostUsers: false
             seccompProfile:
               type: RuntimeDefault
 

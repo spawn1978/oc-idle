@@ -4,9 +4,13 @@
 #
 # Uso:
 #   1. Editar los args de este archivo según el caso de uso (ver opciones abajo)
-#   2. oc apply -f rollback-job.yaml
-#   3. oc logs job/idle-rollback -n idle-ops -f
-#   4. oc delete job/idle-rollback -n idle-ops   (limpiar cuando termine)
+#   2. oc delete job/idle-rollback -n idle-ops --ignore-not-found
+#   3. oc apply -f rollback-job.yaml
+#   4. oc logs job/idle-rollback -n idle-ops -f
+#   5. oc delete job/idle-rollback -n idle-ops   (limpiar cuando termine)
+#
+# NOTA: el Job tiene nombre fijo "idle-rollback". El step 2 es obligatorio si
+#       ya existe un Job anterior — Kubernetes no permite modificar un Job existente.
 #
 # OPCIONES DE ARGS:
 #
@@ -52,7 +56,7 @@ spec:
 
       securityContext:
         runAsNonRoot: true
-        fsGroup: 1000710000
+        hostUsers: false
         seccompProfile:
           type: RuntimeDefault
 
@@ -66,8 +70,8 @@ spec:
           # --- Editar los args según el caso de uso (ver comentarios arriba) ---
           args:
             - "rollback"
-            - "-f"
-            - "/scripts/projects.txt"
+            - "-p"
+            - "node-demo"
 
           env:
             - name: OC_IDLE_STATE_DIR
